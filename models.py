@@ -1,9 +1,24 @@
+import os
+import base64
+import requests
+import openai
+import tqdm
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from timm.layers import trunc_normal_
-from swinir_utils import PatchEmbed, PatchUnEmbed, RSTB, Upsample, UpsampleOneStep
 from ultralytics import YOLO
+from jiwer import wer, cer
+
+from swinir_utils import (
+    PatchEmbed,
+    PatchUnEmbed,
+    RSTB,
+    Upsample,
+    UpsampleOneStep,
+)
 
 class Segmentation:
     def __init__(self, model_path, task):
@@ -194,4 +209,162 @@ class SuperResolution(nn.Module):
         return flops
 
 class TextRecognition:
-    pass
+    def __init__(self, api_url, api_key, model, provider="deepinfra"):
+        self.api_url = api_url
+        self.api_key = api_key
+        self.model = model
+        self.provider = provider 
+
+
+    def call_model(self, image_path):
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+
+        image_b64 = base64.b64encode(image_data).decode("utf-8")
+
+        if self.provider == "openai":
+            openai.api_key = self.api_key
+            image_uri = f"data:image/png;base64,{image_b64}"
+            response = openai.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an OCR system. Your job is to transcribe image text exactly as shown, without interpretation, paraphrasing, translation, summarization, or hallucination."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Extract the exact text from this image. Preserve sentence structure NOT spacing. If anything is unreadable, write '[UNREADABLE]'."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_uri}
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=1024
+            )
+            return response.choices[0].message.content.strip()
+
+        elif self.provider == "deepinfra":
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an OCR system. Your job is to transcribe image text exactly as shown, without interpretation, paraphrasing, translation, summarization, or hallucination."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Extract the exact text from this image. Preserve sentence structure NOT spacing. If anything is unreadable, write '[UNREADABLE]'."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 1024
+            }
+            response = requests.post(self.api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+
+        elif self.provider == "gemini":
+            headers = {"Content-Type": "application/json"}
+
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": "You are an OCR system. Transcribe the exact text from the image. Preserve sentence structure but not spacing. Use '[UNREADABLE]' if needed."
+                            },
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/png",
+                                    "data": image_b64
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            url = f"{self.api_url}?key={self.api_key}"
+
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        else:
+            raise ValueError(f"Unsupported provider: {self.provider}")
+
+    def evaluate(self, test_dir, gt_dir, file_list=None):
+
+        # account for subset testing
+        files = file_list or sorted([
+            f for f in os.listdir(test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ])
+
+        results = []
+        total_wer = total_cer = count = 0 # initial metrics
+
+        for f in tqdm.tqdm(files, desc="Evaluating OCR", ncols=100):
+            try:
+
+                # get results from model
+                ocr_text = self.call_model(os.path.join(test_dir, f))
+                ocr_text = ocr_text.replace("\n", " ").strip() # get ocr text after processing
+
+                # get gt
+                gt_path = os.path.join(gt_dir, os.path.splitext(f)[0] + ".txt")
+
+                gt = None
+                w, c = None, None
+
+                if os.path.exists(gt_path):
+                    gt = open(gt_path, encoding="utf-8").read().replace("\n", " ").strip() # get gt after processing
+                    w, c = wer(gt, ocr_text), cer(gt, ocr_text)
+                    total_wer += w
+                    total_cer += c
+                    count += 1
+
+                results.append({
+                    "file": f,
+                    "ocr_output": ocr_text,
+                    "ground_truth": gt,
+                    "wer": w,
+                    "cer": c,
+                    "status": "ok" if gt else "missing_gt"
+                })
+
+            except Exception as e:
+                results.append({
+                    "file": f,
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        if count:
+            results.append({
+                "overall_metrics": {
+                    "avg_wer": total_wer / count,
+                    "avg_cer": total_cer / count
+                }
+            })
+            print(f"\nAvg WER: {total_wer / count:.3f} | Avg CER: {total_cer / count:.3f}")
+
+        return results

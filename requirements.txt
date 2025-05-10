@@ -1,3 +1,7 @@
 torch
 timm
 ultralytics
+jiwer
+openai
+requests
+tqdm
